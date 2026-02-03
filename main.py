@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, HTTPException
+from fastapi import FastAPI, UploadFile, File, WebSocket, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import shutil
@@ -7,6 +7,9 @@ import uuid
 from dotenv import load_dotenv
 import asyncio
 from datetime import datetime
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Load env vars before importing app modules that use them
 load_dotenv()
@@ -33,7 +36,10 @@ try:
 except Exception as e:
     print(f"Warning: Failed to load graph from DB: {e}")
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Dynamic Knowledge Graph Explorer")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS
 app.add_middleware(
@@ -48,7 +54,8 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/upload", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...), db: DBSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def upload_file(request: Request, file: UploadFile = File(...), db: DBSession = Depends(get_db)):
     try:
         file_id = str(uuid.uuid4())
         ext = os.path.splitext(file.filename)[1]
@@ -83,7 +90,8 @@ async def get_documents(db: DBSession = Depends(get_db)):
     return [{"id": d.id, "name": d.filename, "size": d.size, "date": d.created_at.strftime("%Y-%m-%d %H:%M"), "status": d.status} for d in docs]
 
 @app.post("/search", response_model=SearchResponse)
-async def search_documents(request: SearchRequest):
+@limiter.limit("20/minute")
+async def search_documents(request: Request, search_request: SearchRequest):
     """Test vector similarity search against uploaded documents."""
     import time
     start_time = time.time()
@@ -92,9 +100,9 @@ async def search_documents(request: SearchRequest):
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
     
     # Validate k parameter
-    k = max(1, min(request.k, 20))  # Clamp between 1 and 20
+    k = max(1, min(search_request.k, 20))  # Clamp between 1 and 20
     
-    results_with_scores = rag_engine.query_vector_with_scores(request.query, k=k)
+    results_with_scores = rag_engine.query_vector_with_scores(search_request.query, k=k)
     
     search_results = []
     for doc, score in results_with_scores:
@@ -107,34 +115,35 @@ async def search_documents(request: SearchRequest):
     execution_time_ms = (time.time() - start_time) * 1000
     
     return SearchResponse(
-        query=request.query,
+        query=search_request.query,
         results=search_results,
         execution_time_ms=round(execution_time_ms, 2)
     )
 
 @app.post("/query", response_model=QueryResponse)
-async def query_agent(request: QueryRequest, db: DBSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def query_agent(request: Request, query_request: QueryRequest, db: DBSession = Depends(get_db)):
     try:
         if not rag_engine.vector_store:
              raise HTTPException(status_code=400, detail="No documents uploaded yet.")
         
         # 1. Get or Create Session
-        session_id = request.session_id
+        session_id = query_request.session_id
         if not session_id:
             session_id = str(uuid.uuid4())
-            new_session = Session(id=session_id, title=request.query[:50])
+            new_session = Session(id=session_id, title=query_request.query[:50])
             db.add(new_session)
             db.commit()
         else:
             # Verify session exists
             existing_session = db.query(Session).filter(Session.id == session_id).first()
             if not existing_session:
-                new_session = Session(id=session_id, title=request.query[:50])
+                new_session = Session(id=session_id, title=query_request.query[:50])
                 db.add(new_session)
                 db.commit()
             
         # 2. Save User Message
-        user_msg = Message(session_id=session_id, role="user", content=request.query)
+        user_msg = Message(session_id=session_id, role="user", content=query_request.query)
         db.add(user_msg)
         
         # 3. Get History
@@ -143,7 +152,7 @@ async def query_agent(request: QueryRequest, db: DBSession = Depends(get_db)):
         history = [{"role": m.role, "content": m.content} for m in history_msgs]
         
         # 4. Get Answer
-        response = await agent_system.run_query(request.query, chat_history=history, session_id=session_id)
+        response = await agent_system.run_query(query_request.query, chat_history=history, session_id=session_id)
         
         # 4. Save AI Message
         ai_msg = Message(
@@ -167,7 +176,8 @@ async def query_agent(request: QueryRequest, db: DBSession = Depends(get_db)):
 
 
 @app.post("/query/stream")
-async def query_agent_stream(request: QueryRequest, db: DBSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def query_agent_stream(request: Request, query_request: QueryRequest, db: DBSession = Depends(get_db)):
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -186,10 +196,10 @@ async def query_agent_stream(request: QueryRequest, db: DBSession = Depends(get_
             yield format_sse_event("error", payload)
         return StreamingResponse(error_stream(), media_type="text/event-stream", headers=headers)
 
-    session_id = request.session_id
+    session_id = query_request.session_id
     if not session_id:
         session_id = str(uuid.uuid4())
-        new_session = Session(id=session_id, title=request.query[:50])
+        new_session = Session(id=session_id, title=query_request.query[:50])
         db.add(new_session)
         try:
             db.commit()
@@ -200,7 +210,7 @@ async def query_agent_stream(request: QueryRequest, db: DBSession = Depends(get_
         # Verify session exists
         existing_session = db.query(Session).filter(Session.id == session_id).first()
         if not existing_session:
-            new_session = Session(id=session_id, title=request.query[:50])
+            new_session = Session(id=session_id, title=query_request.query[:50])
             db.add(new_session)
             try:
                 db.commit()
@@ -208,7 +218,7 @@ async def query_agent_stream(request: QueryRequest, db: DBSession = Depends(get_
                 db.rollback()
                 raise HTTPException(status_code=500, detail="Failed to create session.")
 
-    user_msg = Message(session_id=session_id, role="user", content=request.query)
+    user_msg = Message(session_id=session_id, role="user", content=query_request.query)
     db.add(user_msg)
     try:
         db.commit()
@@ -224,7 +234,7 @@ async def query_agent_stream(request: QueryRequest, db: DBSession = Depends(get_
         traces = []
         final_answer = None
         had_error = False
-        stream = agent_system.stream_query(request.query, chat_history=history, session_id=session_id)
+        stream = agent_system.stream_query(query_request.query, chat_history=history, session_id=session_id)
 
         def build(event_type: str, data: dict):
             nonlocal seq
